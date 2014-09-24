@@ -29,6 +29,7 @@ import com.alpine.rconnector.messages.RRequest
 import com.alpine.rconnector.messages.FinishRSession
 import java.util.{ Map => JMap }
 import scala.collection.mutable.{ HashMap => MutableHashMap }
+import scala.sys.process._
 
 /**
  * This is the actor that establishes a connection to R via Rserve
@@ -43,18 +44,23 @@ class RServeActor extends Actor {
   private[this] implicit val log = Logging(context.system, this)
 
   protected[this] var conn: RConnection = new RConnection()
+  protected[this] var pid = conn.eval("Sys.getpid()").asNativeJavaObject.asInstanceOf[Int]
 
   // Map of datasetUuid -> sessionUuid
   private[this] val txMap = MutableHashMap[String, String]()
 
   logActorStart(this)
 
-  override def postStop(): Unit = conn.close()
+  private def killRProcess(): Int = s"kill -9 $pid" !
+
+  override def postStop(): Unit = killRProcess()
+    // conn.close()
 
   override def preRestart(reason: Throwable, message: Option[Any]): Unit = {
     // send message about exception to the client (e.g. for UI reporting)
     sender ! RException(failure(t = reason, text = "R Server Error"))
-    conn.close()
+    killRProcess()
+    //conn.close()
     super.preRestart(reason, message)
   }
 
@@ -135,8 +141,10 @@ class RServeActor extends Actor {
     case FinishRSession(uuid) => {
 
       log.info(s"Finishing R session for UUID $uuid")
-      conn.detach()
+      killRProcess()
       conn = new RConnection()
+      //conn.close()
+      //conn = new RConnection()
       sender ! RSessionFinishedAck(uuid)
     }
 
