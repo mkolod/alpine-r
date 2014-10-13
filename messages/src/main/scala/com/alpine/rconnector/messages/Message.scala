@@ -83,6 +83,24 @@ case object StopAck extends Message
  *
  * @param uuid
  */
+case class RequestRSession(uuid: String, requester: ActorRef) extends Message
+
+/**
+ *
+ * @param uuid
+ */
+case class RequestRSessionAck(uuid: String) extends Message
+
+/**
+ *
+ * @param uuid
+ */
+case class RSessionIsAvailable(uuid: String) extends Message
+
+/**
+ *
+ * @param uuid
+ */
 case class FinishRSession(uuid: String) extends Message
 
 /**
