@@ -65,10 +65,9 @@ class RServeMaster extends Actor {
     str.substring(0, str.length - 1).toLong
   }
 
-  protected val jobQueue = new Queue[RequestRSession]()
+  protected var jobQueue = new Queue[RequestRSession]()
 
-  log.info(s"\n\nNumber of expected R workers = $numRoutees\n\n")
-  log.info(s"\n\nMaximum R session duration (ms): $timeoutMillis\n\n")
+  log.info(s"\n\nConfigured number of R workers = $numRoutees\n\n")
 
   /* rServeRouter is a var because the RServeMaster may keep on running while
   the RServeActors may be shut down by the client by sending the RStop
@@ -85,7 +84,8 @@ class RServeMaster extends Actor {
     Some(Vector.fill(numRoutees)(context.actorOf(Props[RServeActorSupervisor])))
   }
 
-  private def availableActors =
+  // return a set of ActorRefs not bound to R sessions
+  private def availableActors: Option[Set[ActorRef]] =
     rServeRouter.map(_.toSet &~ rWorkerSessionMap.values.toSet)
 
   /* Map to hold session UUID keys and corresponding ActorRef values.
@@ -95,52 +95,13 @@ class RServeMaster extends Actor {
      e.g. for streaming data in chunks from Java to R, and other situations
      that require the Java-R connection be to be stateful beyond a single request.
    */
-  private val rWorkerSessionMap = new HashMap[String, ActorRef]
+  private val rWorkerSessionMap = new HashMap[String, ActorRef]()
 
   /*
    * This is a map of the session UUIDs to remote ActorRefs. This will allow us
    * to kill the sessions in case of a heartbeat failure.
    */
-  private val remoteClientSessionMap = new HashMap[String, ActorRef]
-
-  //  /* Find if there is a free actor and send its ActorRef, otherwise send None.
-  //     This is necessary because there may be more Java requests to R workers
-  //     than there are workers available.
-  //   */
-  //  private def resolveActor(uuid: String, remoteActorRef: ActorRef): Option[ActorRef] = {
-  //
-  //    if (rWorkerSessionMap.contains(uuid)) {
-  //
-  //      log.info(s"Found actor responsible for session $uuid - it is ${rWorkerSessionMap(uuid)}")
-  //      Some(rWorkerSessionMap(uuid))
-  //
-  //    } else {
-  //
-  //      //   val availableActors = rServeRouter.map(_.toSet &~ rWorkerSessionMap.values.toSet)
-  //
-  //      log.info(s"\nNo bound actors for session $uuid found - picking available actor from $availableActors\n")
-  //
-  //      availableActors match {
-  //
-  //        case Some(set) if !set.isEmpty => {
-  //
-  //          val unusedActor = set.head
-  //          log.info(s"\n\nFound unused actor for session $uuid - it is $unusedActor\n\n")
-  //          rWorkerSessionMap += (uuid -> unusedActor)
-  //          remoteClientSessionMap += (uuid -> remoteActorRef)
-  //          log.info(s"\n\nAdding heartbeat for remote session $uuid\nfor actor $remoteActorRef\n\n")
-  //          context.watch(remoteActorRef)
-  //          setTimeoutTimerForUUID(uuid, timeoutMillis)
-  //          Some(unusedActor)
-  //        }
-  //
-  //        case _ => {
-  //          log.info(s"No available actor found for session $uuid")
-  //          None
-  //        }
-  //      }
-  //    }
-  //  }
+  private val remoteClientSessionMap = new HashMap[String, ActorRef]()
 
   /*
    This needs to change the logic. If the session is in progress, permit operation.
@@ -156,26 +117,6 @@ class RServeMaster extends Actor {
 
     rWorkerSessionMap.get(uuid).orElse(addToWorkerMap).orElse(None)
   }
-
-  /*
-    TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-    Check if this is still necessary
-   */
-  /*
-   Time out in case the session hasn't been unbound by now
-   (including if Alpine crashed but the Akka R server is running)
-   */
-//  private def setTimeoutTimerForUUID(uuid: String, timeoutMillis: Long): Unit = {
-//    val tt = new TimerTask {
-//      override def run(): Unit = {
-//        rWorkerSessionMap.get(uuid).map(_ ! FinishRSession(uuid))
-//        // wait for unbinding
-//        Thread.sleep(5000)
-//        rWorkerSessionMap.remove(uuid)
-//      }
-//    }
-//    new Timer(uuid).schedule(tt, timeoutMillis)
-//  }
 
   /*
     TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
@@ -200,95 +141,59 @@ class RServeMaster extends Actor {
       context.watch(remoteRef)
       log.info(s"Remote actor $remoteRef is requested session for UUID $uuid.")
       log.info("Response will be sent back when the session is available.")
+      log.info(s"There are currently ${jobQueue.size} jobs in the queue")
     }
 
     case x @ Terminated(ref) => {
-      /*
-        TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-        1) If remote client was only waiting for a session to be available:
-           - Remove from queue
-           - Remove from remoteClientSessionMap
 
-        2) If session was in progress:
-           - Remove from remoteClientSessionMap
-           - Terminate R session
-        TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-       */
+      // If remote client was only waiting for a session to be available, remove from queue
+      val prevLen = jobQueue.size
+      jobQueue = jobQueue.filter(_ != ref)
+      if (jobQueue.size < prevLen) {
+        log.info(s"There were jobs queued up for client $ref")
+        log.info("Since the client disconnected before the jobs were run (heartbeat failed), they got cancelled")
+      }
+
+      def currentRemoteRefs = remoteClientSessionMap.values.toSet
+      def currentRemoteUUIDs = remoteClientSessionMap.keySet
+      val sessionUuidsToDisassociate = remoteClientSessionMap.filter(_._2 == ref).keySet
+      val rWorkersToTerminate = rWorkerSessionMap.filterKeys(sessionUuidsToDisassociate).values.toSet
+
+      log.info(
+        s"""Heartbeat to remote actor ($ref) has been severed.
+
+                Current remote actor refs:
+                $currentRemoteRefs
+
+                Current session UUIDs associated with remote actors:
+                $currentRemoteUUIDs
+
+                Current session UUIDs associated with workers from disconnected client
+                $sessionUuidsToDisassociate
+
+                R worker actors to terminate due to client disconnection
+                $rWorkersToTerminate
+              """.stripMargin)
+
+      sessionUuidsToDisassociate.flatMap { id => rWorkerSessionMap.get(id).map {ref =>
+        log.info(s"Sending message $id to finish R session for worker actor $ref")
+        // finish session and restart actor and R process
+        ref ! FinishRSession(id)
+        // remove UUID from map
+        log.info(s"Removing UUID $id from R worker session map")
+        rWorkerSessionMap -= id
+      }}
+
+      // TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
+      // In all cases, remove from remoteClientSessionMap
+      sessionUuidsToDisassociate.foreach { id => {
+        log.info(s"Removing UUID $id from remote client session map")
+        remoteClientSessionMap -= id
+      }}
+
+
+
     }
-
-    //      def currentRemoteRefs = remoteClientSessionMap.values.toList.sorted
-    //      def currentRemoteUUIDs = remoteClientSessionMap.keySet.toList.sorted
-    //      def currentRWorkerUUIDs = rWorkerSessionMap.keySet.toList.sorted
-    //
-    //   In case there are more, we'll have to get rid of the temp actors from outside of the Alpine actor system
-    //   and create a permanent typed actor that can be accessed using method calls.
-    //   Currently we have a distinction between the temp actors called outside of the actor system
-    //   and the permanent forwarding actor.
-    // */
-    //      //      val sessionUuidsToTerminate = remoteClientSessionMap.filter(_._2 == ref).keySet.toList.sorted
-    //      val sessionUuidsToTerminate = remoteClientSessionMap.keySet.toList.sorted
-    //
-    //      log.info(
-    //        s"""Heartbeat to remote actor ($ref) has been severed.
-    //
-    //            Current remote actor refs:
-    //            $currentRemoteRefs
-    //
-    //            Current session UUIDs associated with remote actors:
-    //            $currentRemoteUUIDs
-    //
-    //            Current session UUIDs associated with existing R workers (should be the same as the above):
-    //            $currentRWorkerUUIDs
-    //
-    //            Session UUIDs to terminate for the failed connection:
-    //            $sessionUuidsToTerminate
-    //          """.stripMargin)
-    //
-    //      //      sessionUuidsToTerminate.flatMap { id => rWorkerSessionMap.get(id).map {ref =>
-    //      //        log.info(s"Sending message $id to finish R session")
-    //      //        ref ! FinishRSession(id)
-    //      //      }}
-    //
-    //      // finish R sessions
-    //      for { id <- sessionUuidsToTerminate; ref <- rWorkerSessionMap.get(id) } {
-    //        log.info(s"Sending Kill message to actor $ref to finish R session and restart the actor.")
-    //        ref ! Kill
-    //      }
-    //
-    //      // remove the sessions from the rWorkerSessionMap
-    //      for { id <- sessionUuidsToTerminate } {
-    //        log.info(s"Removing session id $id from rWorkerSessionMap")
-    //        rWorkerSessionMap -= id
-    //      }
-    //
-    //      log.info(
-    //        s"""Removed the following sessions from R worker session map:
-    //            $sessionUuidsToTerminate
-    //
-    //            Post-cleanup sessions associated with R workers:
-    //            $currentRWorkerUUIDs
-    //         """.stripMargin)
-    //
-    //      // remove the sessions from remoteClientSessionMap
-    //      for { id <- sessionUuidsToTerminate } {
-    //        log.info(s"Removing session id $id from remoteClientSessionMap")
-    //        remoteClientSessionMap -= id
-    //      }
-    //
-    //      log.info(
-    //        s"""Removed the following sessions from remoteClientSessionMap:
-    //             $sessionUuidsToTerminate
-    //
-    //            Pre-cleanup sessions associated with remote actors:
-    //            $currentRemoteUUIDs
-    //         """.stripMargin
-    //      )
-    //
-    //      log.info(
-    //        s"""Currently available R worker actors:
-    //            $availableActors
-    //         """.stripMargin)
-    //    }
 
     case x @ RRequest(uuid, rScript, returnSet) => {
 
@@ -318,11 +223,7 @@ class RServeMaster extends Actor {
       }
     }
 
-    /*
-      TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-      Check if this behavior is still in use
-      TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-     */
+
     /* Restart the router after it was previously stopped via RStop */
     case RStart => {
 
@@ -337,11 +238,6 @@ class RServeMaster extends Actor {
       sender ! StartAck
     }
 
-    /*
-      TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-      Check if this behavior is still in use
-      TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-     */
     /* Stop the router, shut down the R workers, and clear the R session map */
     case RStop => {
 
@@ -362,12 +258,9 @@ class RServeMaster extends Actor {
       log.info(s"\nAvailable actors before unbinding: $availableActors\n\n")
 
       rWorkerSessionMap.get(uuid).map(_.tell(x, sender))
-      rWorkerSessionMap.remove(uuid)
+      rWorkerSessionMap -= uuid
+      remoteClientSessionMap -= uuid
 
-      /*
-        TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-        Do I need to remove it from remoteClientSessionMap?
-       */
       log.info(s"\n\nR session $uuid unbound from R actor router\n")
       log.info(s"\nAvailable actors after unbinding: $availableActors\n\n")
 
@@ -392,6 +285,13 @@ class RServeMaster extends Actor {
       log.info(s"\n\nResponding with frame size: $frameSize")
       log.info(s"\n\nThe sender is $sender\n\n")
       sender ! RemoteFrameSizeResponse(frameSize)
+    }
+
+    case GetNumEnqueuedJobs => {
+      val numJobs = NumEnqueuedJobs(jobQueue.size)
+      log.info(s"Client $sender asked for the number of enqueued jobs")
+      log.info(s"Sent reply: $numJobs")
+      sender ! numJobs
     }
   }
 

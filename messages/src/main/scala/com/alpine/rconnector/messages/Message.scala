@@ -230,3 +230,7 @@ case object RegisterRemoteActor extends Message
 case object RemoteActorRegistered extends Message
 
 case class PId(pid: Int) extends Message
+
+case object GetNumEnqueuedJobs extends Message
+
+case class NumEnqueuedJobs(numJobs: Int) extends Message

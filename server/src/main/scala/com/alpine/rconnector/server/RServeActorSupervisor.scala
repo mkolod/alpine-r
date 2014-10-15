@@ -41,6 +41,11 @@ class RServeActorSupervisor extends Actor {
 
   override val supervisorStrategy = OneForOneStrategy(maxNrOfRetries = 60, withinTimeRange = 1 minute) {
 
+    case e: ActorKilledException => {
+      log.info(s"R actor killed by supervisor. Restarting actor and R worker process...")
+      Restart
+    }
+
     /* Capture the known exceptions, log the failure and restart actor.
        The actor being restarted will tell the sender about the failure. */
     case e @ (_: RserveException | _: REngineException |
@@ -50,11 +55,6 @@ class RServeActorSupervisor extends Actor {
 
       e.printStackTrace()
       logFailure(e)
-      Restart
-    }
-
-    case e: ActorKilledException => {
-      log.info(s"R actor killed by supervisor. Restarting actor and R worker process...")
       Restart
     }
 
